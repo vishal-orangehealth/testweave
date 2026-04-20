@@ -22,6 +22,12 @@ try:
 except ImportError:
     HAS_PDF = False
 
+try:
+    from huggingface_hub import InferenceClient
+    HAS_HUGGINGFACE = True
+except ImportError:
+    HAS_HUGGINGFACE = False
+
 app = FastAPI(title="TestWeave API")
 
 app.add_middleware(
@@ -31,8 +37,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── API Configuration ───────────────────────────────────────────────────────
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+HUGGINGFACE_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN", "")
+
+# Initialize Anthropic client if key is available
+if ANTHROPIC_API_KEY:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+else:
+    client = None
+
+# Initialize HuggingFace client if token is available
+hf_client = None
+if HAS_HUGGINGFACE and HUGGINGFACE_API_TOKEN:
+    hf_client = InferenceClient(api_key=HUGGINGFACE_API_TOKEN)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 
@@ -175,22 +194,51 @@ async def extract_figma_context(file_key: str, token: str) -> dict:
         "screens": screens[:10],  # cap at 10 screens to avoid token overload
     }
 
-# ─── Claude Generators ───────────────────────────────────────────────────────
+# ─── Claude/HuggingFace Generators ───────────────────────────────────────────
 
 def call_claude(user_message: str) -> dict:
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(500, "ANTHROPIC_API_KEY not configured on server")
-    msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=8000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    raw = msg.content[0].text.strip()
-    # strip accidental markdown fences
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    """Call Claude via Anthropic API, with HuggingFace fallback"""
+    
+    # Try Anthropic Claude first
+    if client and ANTHROPIC_API_KEY:
+        try:
+            msg = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8000,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            raw = msg.content[0].text.strip()
+            # strip accidental markdown fences
+            raw = re.sub(r"^```json\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+        except Exception as e:
+            print(f"Anthropic API error: {e}")
+            # Fall through to HuggingFace
+    
+    # Fallback to HuggingFace
+    if hf_client and HUGGINGFACE_API_TOKEN:
+        try:
+            response = hf_client.text_generation(
+                prompt=f"{SYSTEM_PROMPT}\n\nUser: {user_message}",
+                max_new_tokens=8000,
+                temperature=0.7,
+            )
+            raw = response.strip()
+            # strip accidental markdown fences
+            raw = re.sub(r"^```json\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+        except Exception as e:
+            print(f"HuggingFace API error: {e}")
+            raise HTTPException(500, f"Both AI providers failed: Anthropic error and HuggingFace error")
+    
+    # If neither is available
+    if not ANTHROPIC_API_KEY and not HUGGINGFACE_API_TOKEN:
+        raise HTTPException(500, "No AI API keys configured (need ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN)")
+    else:
+        raise HTTPException(500, "ANTHROPIC_API_KEY and HUGGINGFACE_API_TOKEN not configured on server")
 
 # ─── Document text extractors ────────────────────────────────────────────────
 
@@ -255,7 +303,14 @@ def extract_text_from_file(filename: str, data: bytes) -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "docx": HAS_DOCX, "pdf": HAS_PDF}
+    return {
+        "status": "ok",
+        "docx": HAS_DOCX,
+        "pdf": HAS_PDF,
+        "anthropic": bool(ANTHROPIC_API_KEY),
+        "huggingface": bool(HUGGINGFACE_API_TOKEN),
+        "ai_available": bool(ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN),
+    }
 
 @app.post("/upload/prd")
 async def upload_prd(
