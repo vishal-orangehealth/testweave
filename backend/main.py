@@ -198,7 +198,9 @@ async def extract_figma_context(file_key: str, token: str) -> dict:
 
 def call_claude(user_message: str) -> dict:
     """Call Claude via Anthropic API, with HuggingFace fallback"""
-    
+    anthropic_error = None
+    hf_error = None
+
     # Try Anthropic Claude first
     if client and ANTHROPIC_API_KEY:
         try:
@@ -209,59 +211,48 @@ def call_claude(user_message: str) -> dict:
                 messages=[{"role": "user", "content": user_message}],
             )
             raw = msg.content[0].text.strip()
-            # strip accidental markdown fences
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
         except Exception as e:
+            anthropic_error = str(e)
             print(f"Anthropic API error: {e}")
-            # Fall through to HuggingFace
-    
-    # Fallback to HuggingFace - Use text2text-generation (more compatible)
+
+    # Fallback to HuggingFace (chat completion with Mistral)
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
-            # Try text2text-generation task (works with T5, Flan-T5, etc.)
-            full_prompt = f"{SYSTEM_PROMPT}\n\nInput: {user_message}\n\nOutput (JSON only):"
-            response = hf_client.text2text_generation(
-                text=full_prompt,
-                max_length=8000,
+            response = hf_client.chat_completion(
+                model="mistralai/Mistral-7B-Instruct-v0.3",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                max_tokens=8000,
             )
-            # Extract JSON from response
-            if isinstance(response, list):
-                raw = response[0].get("generated_text", "").strip()
-            else:
-                raw = response.get("generated_text", str(response)).strip()
-            
-            # strip accidental markdown fences
+            raw = response.choices[0].message.content.strip()
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
         except Exception as e:
-            print(f"HuggingFace text2text error: {e}")
-            try:
-                # Fallback: Try text_generation with simpler prompt
-                response = hf_client.text_generation(
-                    prompt=user_message[:1000],  # Limit prompt size
-                    max_new_tokens=4000,
-                    temperature=0.3,  # Lower temp for more deterministic output
-                )
-                if isinstance(response, dict):
-                    raw = response.get("generated_text", str(response)).strip()
-                else:
-                    raw = str(response).strip()
-                
-                raw = re.sub(r"^```json\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-                return json.loads(raw)
-            except Exception as e2:
-                print(f"HuggingFace text_generation error: {e2}")
-                raise HTTPException(500, f"Both AI providers failed: Anthropic and HuggingFace errors")
-    
-    # If neither is available
+            hf_error = str(e)
+            print(f"HuggingFace error: {e}")
+
+    # Surface the real errors
     if not ANTHROPIC_API_KEY and not HUGGINGFACE_API_TOKEN:
-        raise HTTPException(500, "No AI API keys configured (need ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN)")
-    else:
-        raise HTTPException(500, "ANTHROPIC_API_KEY and HUGGINGFACE_API_TOKEN not configured on server")
+        raise HTTPException(500, "No AI API keys configured. Set ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN.")
+
+    parts = []
+    if anthropic_error:
+        parts.append(f"Anthropic: {anthropic_error}")
+    elif not ANTHROPIC_API_KEY:
+        parts.append("Anthropic: ANTHROPIC_API_KEY not set")
+
+    if hf_error:
+        parts.append(f"HuggingFace: {hf_error}")
+    elif not HUGGINGFACE_API_TOKEN:
+        parts.append("HuggingFace: HUGGINGFACE_API_TOKEN not set")
+
+    raise HTTPException(500, " | ".join(parts))
 
 # ─── Document text extractors ────────────────────────────────────────────────
 
