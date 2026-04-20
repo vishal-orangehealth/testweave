@@ -217,22 +217,45 @@ def call_claude(user_message: str) -> dict:
             print(f"Anthropic API error: {e}")
             # Fall through to HuggingFace
     
-    # Fallback to HuggingFace
+    # Fallback to HuggingFace - Use text2text-generation (more compatible)
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
-            response = hf_client.text_generation(
-                prompt=f"{SYSTEM_PROMPT}\n\nUser: {user_message}",
-                max_new_tokens=8000,
-                temperature=0.7,
+            # Try text2text-generation task (works with T5, Flan-T5, etc.)
+            full_prompt = f"{SYSTEM_PROMPT}\n\nInput: {user_message}\n\nOutput (JSON only):"
+            response = hf_client.text2text_generation(
+                text=full_prompt,
+                max_length=8000,
             )
-            raw = response.strip()
+            # Extract JSON from response
+            if isinstance(response, list):
+                raw = response[0].get("generated_text", "").strip()
+            else:
+                raw = response.get("generated_text", str(response)).strip()
+            
             # strip accidental markdown fences
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
         except Exception as e:
-            print(f"HuggingFace API error: {e}")
-            raise HTTPException(500, f"Both AI providers failed: Anthropic error and HuggingFace error")
+            print(f"HuggingFace text2text error: {e}")
+            try:
+                # Fallback: Try text_generation with simpler prompt
+                response = hf_client.text_generation(
+                    prompt=user_message[:1000],  # Limit prompt size
+                    max_new_tokens=4000,
+                    temperature=0.3,  # Lower temp for more deterministic output
+                )
+                if isinstance(response, dict):
+                    raw = response.get("generated_text", str(response)).strip()
+                else:
+                    raw = str(response).strip()
+                
+                raw = re.sub(r"^```json\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                return json.loads(raw)
+            except Exception as e2:
+                print(f"HuggingFace text_generation error: {e2}")
+                raise HTTPException(500, f"Both AI providers failed: Anthropic and HuggingFace errors")
     
     # If neither is available
     if not ANTHROPIC_API_KEY and not HUGGINGFACE_API_TOKEN:
