@@ -213,10 +213,12 @@ def call_claude(user_message: str) -> dict:
         try:
             msg = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=8000,
+                max_tokens=16000,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_message}],
             )
+            if msg.stop_reason == "max_tokens":
+                raise ValueError("Response was truncated (max_tokens reached) — try a shorter PRD")
             raw = msg.content[0].text.strip()
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
