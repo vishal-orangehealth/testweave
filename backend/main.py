@@ -321,22 +321,65 @@ For each test type, generate exhaustively:
 TEST_TYPES = ["happy_path", "negative", "edge_case", "accessibility", "error_states"]
 
 
+def _chunk_text(text: str, chunk_size: int = 4000, overlap: int = 200) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+
+def _merge_screens(all_screens: list[list[dict]]) -> list[dict]:
+    """Merge screen summaries extracted from multiple chunks, deduplicating by name."""
+    merged: dict[str, dict] = {}
+    for chunk_screens in all_screens:
+        for screen in chunk_screens:
+            name = screen.get("screen_name", "").strip()
+            if not name:
+                continue
+            if name not in merged:
+                merged[name] = screen
+            else:
+                existing = merged[name]
+                for field in ("user_stories", "input_fields", "validations", "error_conditions", "acceptance_criteria"):
+                    existing_vals = existing.get(field, [])
+                    new_vals = screen.get(field, [])
+                    combined = list(dict.fromkeys(existing_vals + new_vals))
+                    existing[field] = combined
+    return list(merged.values())
+
+
 def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = "") -> dict:
     """
-    Pass 1: Extract compact screen summaries from full PRD.
+    Pass 1: Chunk PRD → extract screen summaries from each chunk → merge.
     Pass 2: For each screen × each test type, generate focused test cases.
-    Result: 300-500 test cases with full coverage.
+    Result: 300-500 test cases with full coverage, no token truncation.
     """
 
-    # Pass 1 — extract screen summaries
-    summary_raw = _call_llm(
-        system=SUMMARIZE_PROMPT,
-        user=f"Project: {project_name}\n\nPRD:\n{prd_text[:20000]}",
-        max_tokens=2000,
-    )
-    screens_summary = _parse_json(summary_raw)
+    # Pass 1 — chunk PRD and extract screens from each chunk
+    chunks = _chunk_text(prd_text, chunk_size=4000, overlap=200)
+    print(f"PRD split into {len(chunks)} chunks")
 
-    if not isinstance(screens_summary, list) or not screens_summary:
+    chunk_screens = []
+    for i, chunk in enumerate(chunks):
+        try:
+            raw = _call_llm(
+                system=SUMMARIZE_PROMPT,
+                user=f"Project: {project_name}\nChunk {i+1}/{len(chunks)}:\n\n{chunk}",
+                max_tokens=1500,
+            )
+            screens = _parse_json(raw)
+            if isinstance(screens, list):
+                chunk_screens.append(screens)
+        except Exception as e:
+            print(f"Chunk {i+1} extraction failed: {e}")
+            continue
+
+    screens_summary = _merge_screens(chunk_screens)
+
+    if not screens_summary:
         raise HTTPException(500, "Could not extract screens from PRD")
 
     # Pass 2 — per screen × per test type
