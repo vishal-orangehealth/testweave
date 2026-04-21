@@ -1,19 +1,28 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import asyncio
+import io
+import json
+import logging
+import os
+import re
+import time
+import uuid
+
+import anthropic
+import httpx
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import httpx
-import anthropic
-import json
-import os
-import re
-import io
 
-# ── Load .env file (fixes ANTHROPIC_API_KEY not set) ─────────────────────────
-from dotenv import load_dotenv
 load_dotenv()
 
-# ── doc parsers (graceful fallback if not installed) ──────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("testweave")
+
 try:
     from docx import Document as DocxDocument
     HAS_DOCX = True
@@ -46,11 +55,13 @@ app.add_middleware(
 ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 HUGGINGFACE_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN", "")
 
-# Initialize Anthropic client if key is available
+# Initialize Anthropic clients
 if ANTHROPIC_API_KEY:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    async_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 else:
     client = None
+    async_client = None
     print("WARNING: ANTHROPIC_API_KEY not set — Claude will not be available")
 
 # Initialize HuggingFace client if token is available
@@ -203,27 +214,30 @@ async def extract_figma_context(file_key: str, token: str) -> dict:
 
 # ─── Claude/HuggingFace Generators ───────────────────────────────────────────
 
-def _call_llm(system: str, user: str, max_tokens: int) -> str:
-    """Low-level LLM call — returns raw text. Raises HTTPException on total failure."""
+async def _call_llm(system: str, user: str, max_tokens: int) -> str:
+    """Async LLM call — returns raw text. Raises HTTPException on total failure."""
     anthropic_error = None
     hf_error = None
 
-    if client and ANTHROPIC_API_KEY:
+    if async_client and ANTHROPIC_API_KEY:
+        t0 = time.time()
         try:
-            msg = client.messages.create(
+            msg = await async_client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
+            elapsed = time.time() - t0
             if msg.stop_reason == "max_tokens":
                 raise HTTPException(500, f"Response truncated at {max_tokens} tokens — reduce input size or split into smaller chunks")
+            log.info(f"Claude responded in {elapsed:.1f}s | tokens_used={msg.usage.output_tokens}")
             return msg.content[0].text.strip()
         except HTTPException:
             raise
         except Exception as e:
             anthropic_error = str(e)
-            print(f"Anthropic error: {e}")
+            log.error(f"Anthropic error ({time.time()-t0:.1f}s): {e}")
 
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
@@ -238,7 +252,7 @@ def _call_llm(system: str, user: str, max_tokens: int) -> str:
             return response.choices[0].message.content.strip()
         except Exception as e:
             hf_error = str(e)
-            print(f"HuggingFace error: {e}")
+            log.error(f"HuggingFace error: {e}")
 
     if not ANTHROPIC_API_KEY and not HUGGINGFACE_API_TOKEN:
         raise HTTPException(500, "No AI API keys configured.")
@@ -351,72 +365,98 @@ def _merge_screens(all_screens: list[list[dict]]) -> list[dict]:
     return list(merged.values())
 
 
-def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = "") -> dict:
-    """
-    Pass 1: Chunk PRD → extract screen summaries from each chunk → merge.
-    Pass 2: For each screen × each test type, generate focused test cases.
-    Result: 300-500 test cases with full coverage, no token truncation.
-    """
+async def _extract_chunk(i: int, total: int, chunk: str, project_name: str):
+    log.info(f"  Chunk {i+1}/{total} — extracting screens ({len(chunk)} chars)...")
+    try:
+        raw = await _call_llm(
+            system=SUMMARIZE_PROMPT,
+            user=f"Project: {project_name}\nChunk {i+1}/{total}:\n\n{chunk}",
+            max_tokens=800,
+        )
+        screens = _parse_json(raw)
+        if isinstance(screens, list):
+            log.info(f"  Chunk {i+1} → found {len(screens)} screen(s)")
+            return screens
+    except Exception as e:
+        log.warning(f"  Chunk {i+1} extraction failed: {e}")
+    return []
 
-    # Pass 1 — chunk PRD and extract screens from each chunk
+
+async def _generate_for_type(screen: dict, test_type: str, tc_offset: int):
+    screen_name = screen.get("screen_name", "Unknown Screen")
+    log.info(f"    [{screen_name}] generating {test_type}...")
+    user_msg = (
+        f"Screen: {screen_name}\n"
+        f"Test type to generate: {test_type}\n\n"
+        f"Screen summary:\n{json.dumps(screen, indent=2)}\n\n"
+        f"Start IDs from TC-{tc_offset:03d}. Generate ONLY {test_type} test cases. Be exhaustive."
+    )
+    try:
+        raw = await _call_llm(system=TESTCASE_PROMPT, user=user_msg, max_tokens=2000)
+        test_cases = _parse_json(raw)
+        if isinstance(test_cases, list):
+            log.info(f"    [{screen_name}] {test_type} → {len(test_cases)} cases")
+            return test_cases
+    except Exception as e:
+        log.warning(f"    [{screen_name}] {test_type} failed: {e}")
+    return []
+
+
+async def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = "") -> dict:
+    """
+    Pass 1: All chunks extracted in PARALLEL → merge screens.
+    Pass 2: All screen×type combos generated in PARALLEL.
+    """
+    total_start = time.time()
+
+    # Pass 1 — all chunks in parallel
     chunks = _chunk_text(prd_text, chunk_size=1500, overlap=100)
-    print(f"PRD split into {len(chunks)} chunks")
+    log.info(f"PASS 1 — {len(chunks)} chunks firing in parallel...")
 
-    chunk_screens = []
-    for i, chunk in enumerate(chunks):
-        try:
-            raw = _call_llm(
-                system=SUMMARIZE_PROMPT,
-                user=f"Project: {project_name}\nChunk {i+1}/{len(chunks)}:\n\n{chunk}",
-                max_tokens=800,
-            )
-            screens = _parse_json(raw)
-            if isinstance(screens, list):
-                chunk_screens.append(screens)
-        except Exception as e:
-            print(f"Chunk {i+1} extraction failed: {e}")
-            continue
-
-    screens_summary = _merge_screens(chunk_screens)
+    results = await asyncio.gather(*[
+        _extract_chunk(i, len(chunks), chunk, project_name)
+        for i, chunk in enumerate(chunks)
+    ])
+    screens_summary = _merge_screens([r for r in results if r])
+    log.info(f"PASS 1 done — {len(screens_summary)} unique screens in {time.time()-total_start:.1f}s")
 
     if not screens_summary:
         raise HTTPException(500, "Could not extract screens from PRD")
 
-    # Pass 2 — per screen × per test type
-    all_screens = []
-    tc_offset = 1
+    # Pass 2 — all screen×type combos in parallel
+    total_calls = len(screens_summary) * len(TEST_TYPES)
+    log.info(f"PASS 2 — {total_calls} calls firing in parallel...")
 
+    tasks = [
+        _generate_for_type(screen, test_type, tc_offset=1)
+        for screen in screens_summary
+        for test_type in TEST_TYPES
+    ]
+    all_results = await asyncio.gather(*tasks)
+
+    # Reassemble per screen with sequential IDs
+    all_screens = []
+    tc_counter = 1
+    idx = 0
     for screen in screens_summary:
         screen_name = screen.get("screen_name", "Unknown Screen")
-        combined_test_cases = []
-
-        for test_type in TEST_TYPES:
-            user_msg = (
-                f"Screen: {screen_name}\n"
-                f"Test type to generate: {test_type}\n\n"
-                f"Screen summary:\n{json.dumps(screen, indent=2)}\n\n"
-                f"Start IDs from TC-{tc_offset:03d}. Generate ONLY {test_type} test cases. Be exhaustive."
-            )
-            try:
-                raw = _call_llm(system=TESTCASE_PROMPT, user=user_msg, max_tokens=2000)
-                test_cases = _parse_json(raw)
-                if isinstance(test_cases, list):
-                    combined_test_cases.extend(test_cases)
-                    tc_offset += len(test_cases)
-            except Exception as e:
-                print(f"Skipping {test_type} for '{screen_name}': {e}")
-                continue
-
-        if combined_test_cases:
-            all_screens.append({
-                "screen_name": screen_name,
-                "test_cases": combined_test_cases,
-            })
+        combined = []
+        for _ in TEST_TYPES:
+            cases = all_results[idx] or []
+            for tc in cases:
+                tc["id"] = f"TC-{tc_counter:03d}"
+                tc_counter += 1
+                combined.append(tc)
+            idx += 1
+        if combined:
+            all_screens.append({"screen_name": screen_name, "test_cases": combined})
+            log.info(f"  '{screen_name}' — {len(combined)} test cases")
 
     if not all_screens:
         raise HTTPException(500, "Failed to generate test cases for any screen")
 
     all_tcs = [tc for s in all_screens for tc in s.get("test_cases", [])]
+    log.info(f"DONE — {len(all_tcs)} total test cases in {time.time()-total_start:.1f}s")
     summary = {
         "total": len(all_tcs),
         "p0": sum(1 for t in all_tcs if t.get("priority") == "P0"),
@@ -438,9 +478,9 @@ def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = ""
     }
 
 
-def call_claude(user_message: str) -> dict:
+async def call_claude(user_message: str) -> dict:
     """Single-pass generation (used by Figma)."""
-    raw = _call_llm(system=SYSTEM_PROMPT, user=user_message, max_tokens=16000)
+    raw = await _call_llm(system=SYSTEM_PROMPT, user=user_message, max_tokens=16000)
     return _parse_json(raw)
 
 # ─── Document text extractors ────────────────────────────────────────────────
@@ -502,6 +542,21 @@ def extract_text_from_file(filename: str, data: bytes) -> str:
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
+# ─── Job Store ───────────────────────────────────────────────────────────────
+# In-memory store: job_id → {"status": "processing"|"done"|"error", "result": ..., "error": ...}
+jobs: dict = {}
+
+
+async def _run_prd_job(job_id: str, text: str, project_name: str, filename: str):
+    try:
+        result = await generate_tests_two_pass(text, project_name, filename=filename)
+        jobs[job_id] = {"status": "done", "result": result}
+        log.info(f"Job {job_id} completed — {result['summary']['total']} test cases")
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "error": str(e)}
+        log.error(f"Job {job_id} failed: {e}")
+
+
 @app.get("/health")
 def health():
     return {
@@ -515,6 +570,7 @@ def health():
 
 @app.post("/upload/prd")
 async def upload_prd(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     project_name: str = Form("Untitled Project"),
 ):
@@ -535,14 +591,33 @@ async def upload_prd(
     if len(text.strip()) < 50:
         raise HTTPException(400, "Extracted text is too short — is the file empty or scanned?")
 
-    return generate_tests_two_pass(text, project_name, filename=file.filename or "")
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "processing"}
+    background_tasks.add_task(_run_prd_job, job_id, text, project_name, file.filename or "")
+    log.info(f"Job {job_id} queued for '{project_name}'")
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/status/{job_id}")
+def get_job_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+    if job["status"] == "error":
+        raise HTTPException(500, job["error"])
+    return job
+
 
 @app.post("/generate/prd")
-def generate_from_prd(req: PRDRequest):
+async def generate_from_prd(background_tasks: BackgroundTasks, req: PRDRequest):
     if len(req.prd_text.strip()) < 50:
         raise HTTPException(400, "PRD text is too short")
 
-    return generate_tests_two_pass(req.prd_text, req.project_name)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "processing"}
+    background_tasks.add_task(_run_prd_job, job_id, req.prd_text, req.project_name, "")
+    log.info(f"Job {job_id} queued for '{req.project_name}'")
+    return {"job_id": job_id, "status": "processing"}
 
 @app.post("/generate/figma")
 async def generate_from_figma(req: FigmaRequest):
@@ -576,7 +651,7 @@ Instructions:
    navigation flows, and accessibility checks
 5. Component variant names (e.g. "Disabled", "Error", "Loading") = separate test cases
 """
-    result = call_claude(user_msg)
+    result = await call_claude(user_msg)
     result["source"] = "Figma"
     result["project"] = req.project_name
     return result
