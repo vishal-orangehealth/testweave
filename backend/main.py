@@ -9,6 +9,10 @@ import os
 import re
 import io
 
+# ── Load .env file (fixes ANTHROPIC_API_KEY not set) ─────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
 # ── doc parsers (graceful fallback if not installed) ──────────────────────────
 try:
     from docx import Document as DocxDocument
@@ -39,7 +43,7 @@ app.add_middleware(
 
 # ─── API Configuration ───────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 HUGGINGFACE_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN", "")
 
 # Initialize Anthropic client if key is available
@@ -47,11 +51,14 @@ if ANTHROPIC_API_KEY:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 else:
     client = None
+    print("WARNING: ANTHROPIC_API_KEY not set — Claude will not be available")
 
 # Initialize HuggingFace client if token is available
 hf_client = None
 if HAS_HUGGINGFACE and HUGGINGFACE_API_TOKEN:
-    hf_client = InferenceClient(api_key=HUGGINGFACE_API_TOKEN)
+    hf_client = InferenceClient(token=HUGGINGFACE_API_TOKEN)  # FIX: use 'token=' not 'api_key='
+elif not HUGGINGFACE_API_TOKEN:
+    print("WARNING: HUGGINGFACE_API_TOKEN not set — HuggingFace fallback will not be available")
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 
@@ -191,7 +198,7 @@ async def extract_figma_context(file_key: str, token: str) -> dict:
 
     return {
         "file_name": data.get("name", "Figma File"),
-        "screens": screens[:10],  # cap at 10 screens to avoid token overload
+        "screens": screens[:10],
     }
 
 # ─── Claude/HuggingFace Generators ───────────────────────────────────────────
@@ -218,16 +225,19 @@ def call_claude(user_message: str) -> dict:
             anthropic_error = str(e)
             print(f"Anthropic API error: {e}")
 
-    # Fallback to HuggingFace (chat completion with Mistral)
+    # Fallback to HuggingFace LLaMA 3 8B
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
+            # FIX: correct method is chat_completion (not chat.completions)
+            # and provider arg selects the right inference endpoint
             response = hf_client.chat_completion(
                 model="meta-llama/Meta-Llama-3-8B-Instruct",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
+                    {"role": "user",   "content": user_message},
                 ],
                 max_tokens=8000,
+                provider="auto",  # FIX: let HF pick the available provider
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"^```json\s*", "", raw)
@@ -239,7 +249,10 @@ def call_claude(user_message: str) -> dict:
 
     # Surface the real errors
     if not ANTHROPIC_API_KEY and not HUGGINGFACE_API_TOKEN:
-        raise HTTPException(500, "No AI API keys configured. Set ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN.")
+        raise HTTPException(
+            500,
+            "No AI API keys configured. Set ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN in your .env file."
+        )
 
     parts = []
     if anthropic_error:
@@ -274,7 +287,6 @@ def extract_docx(data: bytes) -> str:
         if not text:
             continue
         style = para.style.name if para.style else ""
-        # Preserve heading structure so Claude can identify screens
         if "Heading 1" in style:
             parts.append(f"\n# {text}")
         elif "Heading 2" in style:
@@ -283,7 +295,6 @@ def extract_docx(data: bytes) -> str:
             parts.append(f"\n### {text}")
         else:
             parts.append(text)
-    # Also grab table cell text
     for table in doc.tables:
         for row in table.rows:
             row_text = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
@@ -331,8 +342,7 @@ async def upload_prd(
     file: UploadFile = File(...),
     project_name: str = Form("Untitled Project"),
 ):
-    """Accept .docx / .pdf / .txt and extract text, then generate test cases."""
-    if file.size and file.size > 10 * 1024 * 1024:  # 10 MB cap
+    if file.size and file.size > 10 * 1024 * 1024:
         raise HTTPException(400, "File too large (max 10 MB)")
 
     data = await file.read()
@@ -349,7 +359,6 @@ async def upload_prd(
     if len(text.strip()) < 50:
         raise HTTPException(400, "Extracted text is too short — is the file empty or scanned?")
 
-    # Reuse the same PRD generation logic
     user_msg = f"""Project: {project_name}
 Source: PRD document (uploaded file: {file.filename})
 
