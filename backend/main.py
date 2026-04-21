@@ -222,7 +222,7 @@ def call_claude(user_message: str) -> dict:
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
             response = hf_client.chat_completion(
-                model="meta-llama/Llama-2-7b-chat-hf",
+                model="meta-llama/Meta-Llama-3-8B-Instruct",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
