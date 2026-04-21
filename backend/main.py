@@ -217,8 +217,10 @@ def _call_llm(system: str, user: str, max_tokens: int) -> str:
                 messages=[{"role": "user", "content": user}],
             )
             if msg.stop_reason == "max_tokens":
-                raise ValueError("Response truncated — output too large for token budget")
+                raise HTTPException(500, f"Response truncated at {max_tokens} tokens — reduce input size or split into smaller chunks")
             return msg.content[0].text.strip()
+        except HTTPException:
+            raise
         except Exception as e:
             anthropic_error = str(e)
             print(f"Anthropic error: {e}")
@@ -226,7 +228,7 @@ def _call_llm(system: str, user: str, max_tokens: int) -> str:
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
             response = hf_client.chat_completion(
-                model="meta-llama/Llama-2-7b-chat-hf",
+                model="Qwen/Qwen2.5-72B-Instruct",
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user",   "content": user},
@@ -253,35 +255,33 @@ def _call_llm(system: str, user: str, max_tokens: int) -> str:
     raise HTTPException(500, " | ".join(parts))
 
 
-def _parse_json(raw: str) -> dict:
+def _parse_json(raw: str):
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
 
-SUMMARIZE_PROMPT = """You are a senior product analyst. Given a PRD document, extract a structured summary.
+SUMMARIZE_PROMPT = """You are a senior product analyst. Given a PRD chunk, extract screens/features mentioned.
 
-Output ONLY valid JSON — no prose, no markdown fences.
+Output ONLY a valid JSON array — no prose, no markdown fences.
 
 Schema:
 [
   {
     "screen_name": string,
-    "description": string,
-    "user_stories": [string],
     "input_fields": [string],
-    "validations": [string],
     "error_conditions": [string],
-    "acceptance_criteria": [string]
+    "key_flows": [string]
   }
 ]
 
 Rules:
-- Extract every distinct screen or feature section
-- Keep each string short (under 20 words)
-- input_fields: every form field, search box, dropdown, toggle
-- error_conditions: every failure state, validation error, edge case mentioned
-- acceptance_criteria: the must-pass conditions from the PRD
+- Only include screens explicitly described in this chunk
+- Max 5 words per string value
+- input_fields: form fields, inputs, dropdowns, toggles
+- error_conditions: validation errors, failure states
+- key_flows: main user actions on this screen
+- If no clear screens found, return []
 """
 
 TESTCASE_PROMPT = """You are a senior QA engineer. Given a screen summary and a specific test type, generate ONLY that type of test cases.
@@ -343,7 +343,7 @@ def _merge_screens(all_screens: list[list[dict]]) -> list[dict]:
                 merged[name] = screen
             else:
                 existing = merged[name]
-                for field in ("user_stories", "input_fields", "validations", "error_conditions", "acceptance_criteria"):
+                for field in ("input_fields", "error_conditions", "key_flows"):
                     existing_vals = existing.get(field, [])
                     new_vals = screen.get(field, [])
                     combined = list(dict.fromkeys(existing_vals + new_vals))
@@ -359,7 +359,7 @@ def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = ""
     """
 
     # Pass 1 — chunk PRD and extract screens from each chunk
-    chunks = _chunk_text(prd_text, chunk_size=4000, overlap=200)
+    chunks = _chunk_text(prd_text, chunk_size=1500, overlap=100)
     print(f"PRD split into {len(chunks)} chunks")
 
     chunk_screens = []
@@ -368,7 +368,7 @@ def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = ""
             raw = _call_llm(
                 system=SUMMARIZE_PROMPT,
                 user=f"Project: {project_name}\nChunk {i+1}/{len(chunks)}:\n\n{chunk}",
-                max_tokens=1500,
+                max_tokens=800,
             )
             screens = _parse_json(raw)
             if isinstance(screens, list):
@@ -439,8 +439,8 @@ def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = ""
 
 
 def call_claude(user_message: str) -> dict:
-    """Single-pass generation (used by Figma and /generate/prd)."""
-    raw = _call_llm(system=SYSTEM_PROMPT, user=user_message, max_tokens=8000)
+    """Single-pass generation (used by Figma)."""
+    raw = _call_llm(system=SYSTEM_PROMPT, user=user_message, max_tokens=16000)
     return _parse_json(raw)
 
 # ─── Document text extractors ────────────────────────────────────────────────
