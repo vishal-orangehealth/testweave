@@ -203,71 +203,202 @@ async def extract_figma_context(file_key: str, token: str) -> dict:
 
 # ─── Claude/HuggingFace Generators ───────────────────────────────────────────
 
-def call_claude(user_message: str) -> dict:
-    """Call Claude via Anthropic API, with HuggingFace fallback"""
+def _call_llm(system: str, user: str, max_tokens: int) -> str:
+    """Low-level LLM call — returns raw text. Raises HTTPException on total failure."""
     anthropic_error = None
     hf_error = None
 
-    # Try Anthropic Claude first
     if client and ANTHROPIC_API_KEY:
         try:
             msg = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=16000,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
             )
             if msg.stop_reason == "max_tokens":
-                raise ValueError("Response was truncated (max_tokens reached) — try a shorter PRD")
-            raw = msg.content[0].text.strip()
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
+                raise ValueError("Response truncated — output too large for token budget")
+            return msg.content[0].text.strip()
         except Exception as e:
             anthropic_error = str(e)
-            print(f"Anthropic API error: {e}")
+            print(f"Anthropic error: {e}")
 
-    # Fallback to HuggingFace LLaMA 3 8B
     if hf_client and HUGGINGFACE_API_TOKEN:
         try:
-            # FIX: correct method is chat_completion (not chat.completions)
-            # and provider arg selects the right inference endpoint
             response = hf_client.chat_completion(
-                model="meta-llama/Meta-Llama-3-8B-Instruct",
+                model="meta-llama/Llama-2-7b-chat-hf",
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_message},
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
                 ],
-                max_tokens=8000,
-                 # FIX: let HF pick the available provider
+                max_tokens=max_tokens,
             )
-            raw = response.choices[0].message.content.strip()
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
+            return response.choices[0].message.content.strip()
         except Exception as e:
             hf_error = str(e)
             print(f"HuggingFace error: {e}")
 
-    # Surface the real errors
     if not ANTHROPIC_API_KEY and not HUGGINGFACE_API_TOKEN:
-        raise HTTPException(
-            500,
-            "No AI API keys configured. Set ANTHROPIC_API_KEY or HUGGINGFACE_API_TOKEN in your .env file."
-        )
+        raise HTTPException(500, "No AI API keys configured.")
 
     parts = []
     if anthropic_error:
         parts.append(f"Anthropic: {anthropic_error}")
     elif not ANTHROPIC_API_KEY:
         parts.append("Anthropic: ANTHROPIC_API_KEY not set")
-
     if hf_error:
         parts.append(f"HuggingFace: {hf_error}")
     elif not HUGGINGFACE_API_TOKEN:
         parts.append("HuggingFace: HUGGINGFACE_API_TOKEN not set")
-
     raise HTTPException(500, " | ".join(parts))
+
+
+def _parse_json(raw: str) -> dict:
+    raw = re.sub(r"^```json\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
+
+
+SUMMARIZE_PROMPT = """You are a senior product analyst. Given a PRD document, extract a structured summary.
+
+Output ONLY valid JSON — no prose, no markdown fences.
+
+Schema:
+[
+  {
+    "screen_name": string,
+    "description": string,
+    "user_stories": [string],
+    "input_fields": [string],
+    "validations": [string],
+    "error_conditions": [string],
+    "acceptance_criteria": [string]
+  }
+]
+
+Rules:
+- Extract every distinct screen or feature section
+- Keep each string short (under 20 words)
+- input_fields: every form field, search box, dropdown, toggle
+- error_conditions: every failure state, validation error, edge case mentioned
+- acceptance_criteria: the must-pass conditions from the PRD
+"""
+
+TESTCASE_PROMPT = """You are a senior QA engineer. Given a screen summary and a specific test type, generate ONLY that type of test cases.
+
+Output ONLY valid JSON array — no prose, no markdown fences.
+
+Schema:
+[
+  {
+    "id": string,
+    "title": string,
+    "type": string,
+    "priority": "P0" | "P1" | "P2",
+    "preconditions": [string],
+    "steps": [string],
+    "expected_result": string,
+    "component": string
+  }
+]
+
+Rules:
+- P0: blocks core user journey (auth, payment, core CRUD)
+- P1: important functionality with a workaround
+- P2: edge case, cosmetic, nice-to-have
+- IDs format: TC-001, TC-002, ... (continue from offset given)
+- Steps: user-perspective actions ("Click", "Enter", "Navigate")
+- Expected results: specific and observable
+
+For each test type, generate exhaustively:
+- happy_path: every successful user journey and valid workflow
+- negative: every input field × (empty, invalid format, wrong type, boundary exceeded, special chars, SQL injection attempt, XSS attempt)
+- edge_case: boundary values, max/min limits, simultaneous actions, race conditions, large data, empty states
+- accessibility: keyboard navigation, screen reader labels, focus order, color contrast, ARIA roles, zoom to 200%
+- error_states: network failure, timeout, server error, session expiry, permission denied, concurrent edit conflicts
+"""
+
+TEST_TYPES = ["happy_path", "negative", "edge_case", "accessibility", "error_states"]
+
+
+def generate_tests_two_pass(prd_text: str, project_name: str, filename: str = "") -> dict:
+    """
+    Pass 1: Extract compact screen summaries from full PRD.
+    Pass 2: For each screen × each test type, generate focused test cases.
+    Result: 300-500 test cases with full coverage.
+    """
+
+    # Pass 1 — extract screen summaries
+    summary_raw = _call_llm(
+        system=SUMMARIZE_PROMPT,
+        user=f"Project: {project_name}\n\nPRD:\n{prd_text[:20000]}",
+        max_tokens=2000,
+    )
+    screens_summary = _parse_json(summary_raw)
+
+    if not isinstance(screens_summary, list) or not screens_summary:
+        raise HTTPException(500, "Could not extract screens from PRD")
+
+    # Pass 2 — per screen × per test type
+    all_screens = []
+    tc_offset = 1
+
+    for screen in screens_summary:
+        screen_name = screen.get("screen_name", "Unknown Screen")
+        combined_test_cases = []
+
+        for test_type in TEST_TYPES:
+            user_msg = (
+                f"Screen: {screen_name}\n"
+                f"Test type to generate: {test_type}\n\n"
+                f"Screen summary:\n{json.dumps(screen, indent=2)}\n\n"
+                f"Start IDs from TC-{tc_offset:03d}. Generate ONLY {test_type} test cases. Be exhaustive."
+            )
+            try:
+                raw = _call_llm(system=TESTCASE_PROMPT, user=user_msg, max_tokens=2000)
+                test_cases = _parse_json(raw)
+                if isinstance(test_cases, list):
+                    combined_test_cases.extend(test_cases)
+                    tc_offset += len(test_cases)
+            except Exception as e:
+                print(f"Skipping {test_type} for '{screen_name}': {e}")
+                continue
+
+        if combined_test_cases:
+            all_screens.append({
+                "screen_name": screen_name,
+                "test_cases": combined_test_cases,
+            })
+
+    if not all_screens:
+        raise HTTPException(500, "Failed to generate test cases for any screen")
+
+    all_tcs = [tc for s in all_screens for tc in s.get("test_cases", [])]
+    summary = {
+        "total": len(all_tcs),
+        "p0": sum(1 for t in all_tcs if t.get("priority") == "P0"),
+        "p1": sum(1 for t in all_tcs if t.get("priority") == "P1"),
+        "p2": sum(1 for t in all_tcs if t.get("priority") == "P2"),
+        "happy_path": sum(1 for t in all_tcs if t.get("type") == "happy_path"),
+        "negative": sum(1 for t in all_tcs if t.get("type") == "negative"),
+        "edge_case": sum(1 for t in all_tcs if t.get("type") == "edge_case"),
+        "accessibility": sum(1 for t in all_tcs if t.get("type") == "accessibility"),
+        "error_states": sum(1 for t in all_tcs if t.get("type") == "error_states"),
+    }
+
+    return {
+        "project": project_name,
+        "source": "PRD",
+        "filename": filename,
+        "screens": all_screens,
+        "summary": summary,
+    }
+
+
+def call_claude(user_message: str) -> dict:
+    """Single-pass generation (used by Figma and /generate/prd)."""
+    raw = _call_llm(system=SYSTEM_PROMPT, user=user_message, max_tokens=8000)
+    return _parse_json(raw)
 
 # ─── Document text extractors ────────────────────────────────────────────────
 
@@ -361,49 +492,14 @@ async def upload_prd(
     if len(text.strip()) < 50:
         raise HTTPException(400, "Extracted text is too short — is the file empty or scanned?")
 
-    user_msg = f"""Project: {project_name}
-Source: PRD document (uploaded file: {file.filename})
-
---- PRD CONTENT START ---
-{text[:14000]}
---- PRD CONTENT END ---
-
-Instructions:
-1. Identify all distinct screens/features in this PRD
-2. For each screen extract: user stories, acceptance criteria, input fields, error conditions
-3. Generate test cases covering happy path, edge cases, negative cases, and accessibility
-4. Group test cases by screen/feature
-5. Use actual text from the PRD in expected results where possible
-"""
-    result = call_claude(user_msg)
-    result["source"] = "PRD"
-    result["project"] = project_name
-    result["filename"] = file.filename
-    return result
+    return generate_tests_two_pass(text, project_name, filename=file.filename or "")
 
 @app.post("/generate/prd")
 def generate_from_prd(req: PRDRequest):
     if len(req.prd_text.strip()) < 50:
         raise HTTPException(400, "PRD text is too short")
 
-    user_msg = f"""Project: {req.project_name}
-Source: PRD document
-
---- PRD CONTENT START ---
-{req.prd_text[:12000]}
---- PRD CONTENT END ---
-
-Instructions:
-1. First identify all distinct screens/features in this PRD
-2. For each screen, extract: user stories, acceptance criteria, input fields, error conditions
-3. Generate test cases covering happy path, edge cases, negative cases, and accessibility
-4. Group test cases by screen/feature
-5. Be specific — use actual text from the PRD in expected results where possible
-"""
-    result = call_claude(user_msg)
-    result["source"] = "PRD"
-    result["project"] = req.project_name
-    return result
+    return generate_tests_two_pass(req.prd_text, req.project_name)
 
 @app.post("/generate/figma")
 async def generate_from_figma(req: FigmaRequest):
