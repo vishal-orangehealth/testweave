@@ -237,7 +237,7 @@ def call_claude(user_message: str) -> dict:
                     {"role": "user",   "content": user_message},
                 ],
                 max_tokens=8000,
-                provider="auto",  # FIX: let HF pick the available provider
+                 # FIX: let HF pick the available provider
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"^```json\s*", "", raw)
