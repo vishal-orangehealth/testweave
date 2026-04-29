@@ -266,7 +266,31 @@ export default function App() {
       }
 
       const data = await res.json();
-      setResult(data);
+
+      // PRD endpoints return a job_id — poll until done
+      if (data.job_id) {
+        let attempts = 0;
+        while (attempts < 120) {
+          await new Promise(r => setTimeout(r, 2000));
+          const statusRes = await fetch(`${API_BASE}/status/${data.job_id}`);
+          if (!statusRes.ok) {
+            const err = await statusRes.json().catch(() => ({ detail: statusRes.statusText }));
+            throw new Error(err.detail || 'Job failed');
+          }
+          const statusData = await statusRes.json();
+          if (statusData.status === 'done') {
+            setResult(statusData.result);
+            break;
+          }
+          if (statusData.status === 'error') {
+            throw new Error(statusData.error || 'Job failed');
+          }
+          attempts++;
+        }
+        if (attempts >= 120) throw new Error('Timed out waiting for test case generation');
+      } else {
+        setResult(data);
+      }
     } catch (e) {
       setError(e.message);
     } finally {
