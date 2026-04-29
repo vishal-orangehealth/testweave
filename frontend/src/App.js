@@ -282,7 +282,11 @@ export default function App() {
           }
           const statusData = await statusRes.json();
           if (statusData.status === 'done') {
-            setResult(statusData.result);
+            const r = statusData.result;
+            if (!r || !r.screens || r.screens.length === 0) {
+              throw new Error('No test cases were generated — check that your API key is set and the document has readable content.');
+            }
+            setResult(r);
             break;
           }
           if (statusData.status === 'error') {
