@@ -270,8 +270,14 @@ async def _call_llm(system: str, user: str, max_tokens: int) -> str:
 
 
 def _parse_json(raw: str):
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+    raw = re.sub(r"\n?```\s*$", "", raw)
+    raw = raw.strip()
+    if not raw.startswith(('{', '[')):
+        m = re.search(r'[{\[]', raw)
+        if m:
+            raw = raw[m.start():]
     return json.loads(raw)
 
 
@@ -552,6 +558,10 @@ async def _run_prd_job(job_id: str, text: str, project_name: str, filename: str)
         result = await generate_tests_two_pass(text, project_name, filename=filename)
         jobs[job_id] = {"status": "done", "result": result}
         log.info(f"Job {job_id} completed — {result['summary']['total']} test cases")
+    except HTTPException as e:
+        msg = str(e.detail) if e.detail else f"HTTP {e.status_code}"
+        jobs[job_id] = {"status": "error", "error": msg}
+        log.error(f"Job {job_id} failed: {msg}")
     except Exception as e:
         jobs[job_id] = {"status": "error", "error": str(e)}
         log.error(f"Job {job_id} failed: {e}")

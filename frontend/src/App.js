@@ -219,6 +219,7 @@ export default function App() {
   const [figmaToken, setFigmaToken] = useState('');
   const [projectName, setProjectName] = useState('');
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState('');
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
   const [filter, setFilter] = useState('all');
@@ -228,6 +229,7 @@ export default function App() {
     setError('');
     setResult(null);
     setLoading(true);
+    setLoadingMsg('Submitting…');
 
     try {
       let res;
@@ -269,6 +271,7 @@ export default function App() {
 
       // PRD endpoints return a job_id — poll until done
       if (data.job_id) {
+        setLoadingMsg('Generating test cases… this may take a minute');
         let attempts = 0;
         while (attempts < 120) {
           await new Promise(r => setTimeout(r, 2000));
@@ -295,6 +298,7 @@ export default function App() {
       setError(e.message);
     } finally {
       setLoading(false);
+      setLoadingMsg('');
     }
   }, [tab, prdMode, prdFile, prdText, figmaUrl, figmaToken, projectName]);
 
@@ -455,7 +459,7 @@ export default function App() {
             {/* Generate */}
             <button className="generate-btn" onClick={generate} disabled={loading}>
               {loading
-                ? <><Loader2 size={16} className="spin" /> Generating test cases…</>
+                ? <><Loader2 size={16} className="spin" /> {loadingMsg || 'Generating test cases…'}</>
                 : <><Sparkles size={16} /> Generate test cases</>
               }
             </button>
